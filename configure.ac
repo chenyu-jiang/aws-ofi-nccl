@@ -74,7 +74,7 @@ AS_IF([test "x${enable_trace}" = "xyes" ],
 AC_DEFINE_UNQUOTED([OFI_NCCL_TRACE], [${trace}], [Defined to 1 if aws-ofi-nccl was configured with --enable-trace, 0 otherwise])
 
 # Checks for header files.
-AC_CHECK_HEADERS([limits.h stdlib.h string.h unistd.h rdma/fabric.h cuda_runtime.h], [],[
+AC_CHECK_HEADERS([limits.h stdlib.h string.h unistd.h rdma/fabric.h cuda_runtime.h time.h], [],[
 	AC_MSG_ERROR([unable to find required headers])
 ])
 
@@ -83,6 +83,9 @@ AC_SEARCH_LIBS([dlopen], [dl], [], [
 ])
 AC_SEARCH_LIBS([fi_getinfo], [fabric], [], [
   AC_MSG_ERROR([unable to find libfabric])
+])
+AC_SEARCH_LIBS([clock_gettime], [rt], [], [
+  AC_MSG_ERROR([unable to find librt])
 ])
 
 AM_INIT_AUTOMAKE([-Wall -Werror foreign subdir-objects])
