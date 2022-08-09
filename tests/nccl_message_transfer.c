@@ -519,7 +519,7 @@ int main(int argc, char* argv[])
 	MPI_Reduce(&local_sum, &global_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 
 	if(rank == 0) {
-		double global_avg = global_sum / (double)num_ranks;
+		double global_avg = global_sum / (double)(num_ranks * num_iters);
 		printf("[Rank %d] Time elapsed:\n", rank);
 		printf("[Rank %d]     Min: %f microseconds, equivalent bandwidth: %f Gbps per session.\n", rank, global_min, send_size * num_requests * 8 / global_min / 1e3);
 		printf("[Rank %d]     Max: %f microseconds, equivalent bandwidth: %f Gbps per session.\n", rank, global_max, send_size * num_requests * 8 / global_max / 1e3);
