@@ -31,16 +31,17 @@ void reset_buffers(nccl_ofi_req_t ** req, int* req_completed, int num_requests) 
 	memset(req_completed, 0, sizeof(int) * num_requests);
 }
 
-void alloc_and_reg_buffers(ncclNet_t *extNet, int num_requests, size_t buf_size, int buffer_type, 
-	ofiComm_t *comm, void** mhandle, char* buf) {
+ncclResult_t alloc_and_reg_buffers(ncclNet_t *extNet, int num_requests, size_t buf_size, int buffer_type, 
+	ofiComm_t *comm, void** mhandle, char** buf) {
 	for (int idx = 0; idx < num_requests; idx++) {
 		OFINCCLCHECK(allocate_buff((void **)&buf[idx], buf_size, buffer_type));
 		OFINCCLCHECK(extNet->regMr((void *)comm, (void *)buf[idx], buf_size,
 					buffer_type, &mhandle[idx]));
 	}
+	return ncclSuccess;
 }
 
-void test_for_completion(ncclNet_t* extNet, int num_requests, int* req_completed, nccl_ofi_req_t ** req) {
+ncclResult_t test_for_completion(ncclNet_t* extNet, int num_requests, int* req_completed, nccl_ofi_req_t ** req) {
 	/* Test for completions */
 	int done, received_size;
 	int inflight_reqs = num_requests;
@@ -59,9 +60,8 @@ void test_for_completion(ncclNet_t* extNet, int num_requests, int* req_completed
 		if (inflight_reqs == 0)
 			break;
 	}
+	return ncclSuccess;
 }
-
-void flush() {}
 
 int main(int argc, char* argv[])
 {
@@ -77,7 +77,7 @@ int main(int argc, char* argv[])
 			MPI_MAX_PROCESSOR_NAME, MPI_BYTE, MPI_COMM_WORLD);
 
 	/* Determine local rank */
-	for (i = 0; i < num_ranks; i++) {
+	for (int i = 0; i < num_ranks; i++) {
 		if (!strcmp(all_proc_name[rank], all_proc_name[i])) {
 			if (i < rank) {
 				++local_rank;
@@ -85,7 +85,6 @@ int main(int argc, char* argv[])
 		}
 	}
 
-	int opt;
 	int num_requests = 0;
 	int num_iters = 0;
 	int num_warmup_iters = 0;
@@ -98,7 +97,8 @@ int main(int argc, char* argv[])
 	if(argc != 2) {
 		printf("Usage: %s ARGS_FILE\n", argv[0]);
 		printf("ARGS_FILE format: one arg per line. Empty line separates ranks.\n");
-		return FAILURE;
+		MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+		return EXIT_FAILURE;
 	}
 
 	char* args_file = argv[1];
@@ -106,7 +106,8 @@ int main(int argc, char* argv[])
 	fp = fopen(args_file,"r");
 	if (!fp) {
 		fprintf(stderr, "Failed to open file %s.\n", args_file);
-		return FAILURE;
+		MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+		return EXIT_FAILURE;
 	}
 	size_t line_size = MAX_LINE_SIZE;
 	char* line_buff = malloc(MAX_LINE_SIZE);
@@ -129,12 +130,17 @@ int main(int argc, char* argv[])
 			rank_argc++;
 		}
 	}
-	assert ((curr_rank == world_size) && "Number of ranks in ARGS_FILE is not equal to world size.");
+	if (curr_rank != num_ranks) {
+		fprintf(stderr, "[Rank %d] Number of ranks in ARGS_FILE is not equal to world size.", rank);
+		MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+		return EXIT_FAILURE;
+	}
 	free(line_buff);
 	fclose(fp);
 
 	if (rank_argc != 8) {
 		fprintf(stderr, "[Rank %d] Invalid number of arguments. Expected 7, got %d\n", rank, rank_argc - 1);
+		MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
 	}
 	printf("[Rank %d] Read args file complete. argc: %d\n", rank, rank_argc);
 
@@ -148,30 +154,35 @@ int main(int argc, char* argv[])
 
 	if (num_requests <= 0) {
 		fprintf(stderr, "[Rank %d] Invalid number of requests %d.\n", rank, num_requests);
-		exit(EXIT_FAILURE);
+		MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+		return EXIT_FAILURE;
 	}
 	if (num_iters <= 0) {
 		fprintf(stderr, "[Rank %d] Invalid number of iterations %d.\n", rank, num_requests);
-		exit(EXIT_FAILURE);
+		MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+		return EXIT_FAILURE;
 	}
 	if (send_size <= 0) {
 		fprintf(stderr, "[Rank %d] Invalid send size %zu.\n", rank, send_size);
-		exit(EXIT_FAILURE);
+		MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+		return EXIT_FAILURE;
 	}
 	if (dev_id == -1) {
 		fprintf(stderr, "[Rank %d] Device id uninitialized.\n", rank);
-		exit(EXIT_FAILURE);
+		MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+		return EXIT_FAILURE;
 	}
 	if (remote_rank == -1) {
 		fprintf(stderr, "[Rank %d] Remote rank uninitialized.\n", rank);
-		exit(EXIT_FAILURE);
+		MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+		return EXIT_FAILURE;
 	}
 
 	size_t recv_size = send_size + 200;
 	int buffer_type = NCCL_PTR_HOST;
 
 	/* Plugin defines */
-	int ndev, dev, cuda_dev, i;
+	int ndev, dev, cuda_dev;
 	sendComm_t *sComm = NULL;
 	listenComm_t *lComm = NULL;
 	recvComm_t *rComm = NULL;
@@ -206,7 +217,8 @@ int main(int argc, char* argv[])
 	CUDACHECK(cudaGetDeviceCount(&n_local_devs));
 	if (dev_id >= n_local_devs) {
 		fprintf(stderr, "Invalid device id %d\n", dev_id);
-		exit(EXIT_FAILURE);
+		MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+		return EXIT_FAILURE;
 	}
 
 	cuda_dev = dev_id;
@@ -215,8 +227,11 @@ int main(int argc, char* argv[])
 
 	/* Get external Network from NCCL-OFI library */
 	extNet = get_extNet();
-	if (extNet == NULL)
-		return -1;
+	if (extNet == NULL) {
+		fprintf(stderr, "[Rank %d] Failed to get extNet from NCCL-OFI library.\n", rank);
+		MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+		return EXIT_FAILURE;
+	}
 
 	/* Init API */
 	OFINCCLCHECK(extNet->init(&logger));
@@ -314,14 +329,14 @@ int main(int argc, char* argv[])
 			// populate expected buffer
 			OFINCCLCHECK(initialize_buff((void *)expected_buf, send_size, NCCL_PTR_HOST));
 			// populate send buffer
-			for(idx = 0; idx < num_requests; idx++) {
+			for(int idx = 0; idx < num_requests; idx++) {
 				OFINCCLCHECK(initialize_buff((void *)send_buf[idx], send_size, buffer_type));
 			}
 			// barrier
 			MPI_Barrier(MPI_COMM_WORLD);
 			// start timer
 			clock_gettime(CLOCK_MONOTONIC, &start);
-			for (idx = 0; idx < num_requests; idx++) {
+			for (int idx = 0; idx < num_requests; idx++) {
 #if (NCCL_VERSION_CODE >= NCCL_VERSION(2, 12, 0)) /* Support NCCL v2.12 */
 				while (req[idx] == NULL) {
 					OFINCCLCHECK(extNet->isend((void *)sComm, (void *)send_buf[idx], send_size, tag,
@@ -380,14 +395,14 @@ int main(int argc, char* argv[])
 			// populate expected buffer
 			OFINCCLCHECK(initialize_buff((void *)expected_buf, send_size, NCCL_PTR_HOST));
 			// populate recv buffer
-			for(idx = 0; idx < num_requests; idx++) {
+			for(int idx = 0; idx < num_requests; idx++) {
 				OFINCCLCHECK(initialize_buff((void *)recv_buf[idx], recv_size, buffer_type));
 			}
 			// barrier
 			MPI_Barrier(MPI_COMM_WORLD);
 			// start timer
 			clock_gettime(CLOCK_MONOTONIC, &start);
-			for (idx = 0; idx < num_requests; idx++) {
+			for (int idx = 0; idx < num_requests; idx++) {
 #if (NCCL_VERSION_CODE >= NCCL_VERSION(2, 12, 0)) /* Support NCCL v2.12 */
 				while (req[idx] == NULL) {
 					OFINCCLCHECK(extNet->irecv((void *)rComm, nrecv, (void *)&recv_buf[idx],
@@ -408,7 +423,7 @@ int main(int argc, char* argv[])
 			clock_gettime(CLOCK_MONOTONIC, &end);
 			MPI_Barrier(MPI_COMM_WORLD);
 			NCCL_OFI_TRACE(NCCL_NET, "[Rank %d] Got completions for %d requests.", rank, num_requests);
-			for(idx = 0; idx < num_requests; idx++) {
+			for(int idx = 0; idx < num_requests; idx++) {
 				if (buffer_type == NCCL_PTR_CUDA) {
 					NCCL_OFI_TRACE(NCCL_NET,
 							"[Rank %d] Issue flush for data consistency. Request idx: %d",
@@ -424,7 +439,7 @@ int main(int argc, char* argv[])
 								(void **)recv_buf[idx],
 								recv_size, mhandle[idx], (void **)&iflush_req));
 #endif
-					done = 0;
+					int done = 0;
 					if (iflush_req) {
 						while (!done) {
 							OFINCCLCHECK(extNet->test((void *)iflush_req, &done, NULL));
@@ -452,7 +467,7 @@ int main(int argc, char* argv[])
 	}
 
 	/* Deregister memory handle */
-	for(idx = 0; idx < num_requests; idx++) {
+	for(int idx = 0; idx < num_requests; idx++) {
 		if (is_client) {
 			OFINCCLCHECK(extNet->deregMr((void *)sComm, mhandle[idx]));
 		} else {
@@ -462,7 +477,7 @@ int main(int argc, char* argv[])
 
 	/* Deallocate buffers */
 	OFINCCLCHECK(deallocate_buffer(expected_buf, NCCL_PTR_HOST));
-	for (idx = 0; idx < num_requests; idx++) {
+	for (int idx = 0; idx < num_requests; idx++) {
 		if (send_buf[idx])
 			OFINCCLCHECK(deallocate_buffer(send_buf[idx], buffer_type));
 		if (recv_buf[idx])
@@ -485,7 +500,7 @@ int main(int argc, char* argv[])
 
 	if(rank == 0) {
 		double global_avg = global_sum / (double)num_ranks;
-		printf("[Rank %d] Time elapsed:\n");
+		printf("[Rank %d] Time elapsed:\n", rank);
 		printf("[Rank %d]     Min: %f microseconds, equivalent bandwidth: %f Gbps per session.\n", rank, global_min, send_size * num_requests * 8 / global_min / 1e3);
 		printf("[Rank %d]     Max: %f microseconds, equivalent bandwidth: %f Gbps per session.\n", rank, global_max, send_size * num_requests * 8 / global_max / 1e3);
 		printf("[Rank %d]     Avg: %f microseconds, equivalent bandwidth: %f Gbps per session.\n", rank, global_avg, send_size * num_requests * 8 / global_avg / 1e3);

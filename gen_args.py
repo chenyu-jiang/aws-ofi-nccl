@@ -19,6 +19,13 @@ def add_parser_args(parser):
         default=100
     )
     parser.add_argument(
+        "-w",
+        "--warmup-iters",
+        help="Number of warmup iterations to run, default 20",
+        type=int,
+        default=20
+    )
+    parser.add_argument(
         "-s",
         "--size",
         help="Size of each send request, default 1MB.",
@@ -59,8 +66,9 @@ def gen_send_args(args):
             mc_sessions.append((src_device, dst_device))
 
     def get_params(local_dev_id, remote_rank, is_client):
-        return [str(args.requests)
+        return [str(args.requests),
                 str(args.iters),
+                str(args.warmup_iters),
                 str(args.size),
                 str(local_dev_id),
                 str(remote_rank),
@@ -99,12 +107,12 @@ if __name__ == "__main__":
         type=str,
     )
 
-    args, n_ranks = parser.parse_args()
+    args = parser.parse_args()
 
     if args.output is None:
         args.output = "./nccl_msg_" + args.config.split(".")[0] + ".args"
 
-    output_args = gen_send_args(args)
+    output_args, n_ranks = gen_send_args(args)
 
     print(f"Created args file with {n_ranks} total ranks.")
 
