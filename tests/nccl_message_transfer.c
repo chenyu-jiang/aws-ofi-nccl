@@ -8,6 +8,7 @@
  */
 #include <unistd.h>
 #include <time.h>
+#include <limits.h>
 #include "test-common.h"
 
 double diff_microseconds(struct timespec start, struct timespec end)
@@ -162,7 +163,7 @@ int main(int argc, char* argv[])
 		MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
 		return EXIT_FAILURE;
 	}
-	if (send_size <= 0) {
+	if (send_size == 0 || send_size == ULONG_MAX) {
 		fprintf(stderr, "[Rank %d] Invalid send size %zu.\n", rank, send_size);
 		MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
 		return EXIT_FAILURE;
@@ -190,6 +191,9 @@ int main(int argc, char* argv[])
 	char src_handle[NCCL_NET_HANDLE_MAXSIZE] = {0};
 
 	ofi_log_function = logger;
+
+	NCCL_OFI_INFO(NCCL_INIT, "[Rank %d] num_requests: %d, num_iters: %d, num_warmup_iters: %d, send_size: %d, dev_id: %d, remote_rank: %d, is_client: %d", 
+						rank, num_requests, num_iters, num_warmup_iters, send_size, dev_id, remote_rank, is_client);
 
 	/* Initialisation for data transfer */
 	nccl_ofi_req_t *req[num_requests];
@@ -320,7 +324,11 @@ int main(int argc, char* argv[])
 					remote_rank);
 
 		// allocate send buffer and reg send memory regions
-		alloc_and_reg_buffers(extNet, num_requests, send_size, buffer_type, sComm, mhandle, send_buf);
+		if (alloc_and_reg_buffers(extNet, num_requests, send_size, buffer_type, sComm, mhandle, send_buf) != ncclSuccess) {
+			fprintf(stderr, "[Rank %d] Failed to allocate and register send buffers\n", rank);
+			MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+			return EXIT_FAILURE;
+		}
 		NCCL_OFI_INFO(NCCL_NET, "[Rank %d] Successfully registered send memory for %d requests", rank, num_requests);
 
 		for(int iter = 0; iter < num_iters + num_warmup_iters; iter ++) {
@@ -352,7 +360,11 @@ int main(int argc, char* argv[])
 #if OFI_NCCL_TRACE
 			NCCL_OFI_TRACE(NCCL_NET, "[Rank %d] Successfully posted %d send requests to rank %d", rank, num_requests, remote_rank);
 #endif
-			test_for_completion(extNet, num_requests, req_completed, req);
+			if(test_for_completion(extNet, num_requests, req_completed, req) != ncclSuccess) {
+				fprintf(stderr, "[Rank %d] Failed to test for completion\n", rank);
+				MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+				return EXIT_FAILURE;
+			}
 			// stop timer
 			clock_gettime(CLOCK_MONOTONIC, &end);
 			MPI_Barrier(MPI_COMM_WORLD);
@@ -386,7 +398,11 @@ int main(int argc, char* argv[])
 				rank, remote_rank);
 
 		// allocate and register recv memory regions
-		alloc_and_reg_buffers(extNet, num_requests, recv_size, buffer_type, rComm, mhandle, recv_buf);
+		if(alloc_and_reg_buffers(extNet, num_requests, recv_size, buffer_type, rComm, mhandle, recv_buf) != ncclSuccess) {
+			fprintf(stderr, "[Rank %d] Failed to allocate and register recv buffers\n", rank);
+			MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+			return EXIT_FAILURE;
+		}
 		NCCL_OFI_INFO(NCCL_NET, "[Rank %d] Successfully registered receive memory for %d requests", rank, num_requests);
 
 		for(int iter = 0; iter < num_iters + num_warmup_iters; iter ++) {
@@ -418,7 +434,11 @@ int main(int argc, char* argv[])
 #if OFI_NCCL_TRACE
 			NCCL_OFI_TRACE(NCCL_NET, "[Rank %d] Successfully posted %d recv requests from rank %d", rank, num_requests, remote_rank);
 #endif
-			test_for_completion(extNet, num_requests, req_completed, req);
+			if(test_for_completion(extNet, num_requests, req_completed, req) != ncclSuccess) {
+				fprintf(stderr, "[Rank %d] Failed to test for completion\n", rank);
+				MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+				return EXIT_FAILURE;
+			}
 			// stop timer. don't time data flush for now
 			clock_gettime(CLOCK_MONOTONIC, &end);
 			MPI_Barrier(MPI_COMM_WORLD);
