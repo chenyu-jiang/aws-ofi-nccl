@@ -159,6 +159,7 @@ ncclResult_t validate_data(char *recv_buf, char *expected_buf, size_t size, int 
 		CUDACHECK(cudaMemcpy(recv_buf_host, recv_buf, size, cudaMemcpyDeviceToHost));
 
 		ret = memcmp(recv_buf_host, expected_buf, size);
+		OFINCCLCHECK(deallocate_buffer(recv_buf_host, NCCL_PTR_HOST));
 		if (ret != 0) {
 			NCCL_OFI_WARN("Data validation check failed. RC: %d, Buffer Type: %d",
 				      ret, buffer_type);
