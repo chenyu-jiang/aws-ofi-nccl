@@ -2,6 +2,7 @@ import os
 import shutil
 import subprocess
 import argparse
+from collections import defaultdict
 
 def add_parser_args(parser):
     # adds common parser args, returns nothing
@@ -76,23 +77,48 @@ def gen_send_args(args):
             ]
 
     params = []
+    node_send_sess_indices = defaultdict(list)
+    node_recv_sess_indices = defaultdict(list)
 
     for session_idx, (src_idx, dst_idx) in enumerate(mc_sessions):
-        send_rank = session_idx * 2
-        recv_rank = send_rank + 1
         src_node = get_node(src_idx)
         dst_node = get_node(dst_idx)
+        node_send_sess_indices[src_node].append(session_idx)
+        node_recv_sess_indices[dst_node].append(session_idx)
 
-        send_local_dev = src_idx % args.n_gpus_per_node
-        recv_local_dev = dst_idx % args.n_gpus_per_node
+    curr_rank = 0
+    rank2sess = {}
+    srcsess2rank = {}
+    dstsess2rank = {}
+    for node_idx in range(args.n_nodes):
+        for sess_idx in node_send_sess_indices[node_idx]:
+            srcsess2rank[sess_idx] = curr_rank
+            rank2sess[curr_rank] = (sess_idx, True)
+            curr_rank += 1
+        for sess_idx in node_recv_sess_indices[node_idx]:
+            dstsess2rank[sess_idx] = curr_rank
+            rank2sess[curr_rank] = (sess_idx, False)
+            curr_rank += 1
 
-        params += get_params(send_local_dev, recv_rank, True)
+    for rank in range(curr_rank):
+        sess_idx, is_client = rank2sess[rank]
+        src_idx, dst_idx = mc_sessions[sess_idx]
+
+        if is_client:
+            node = get_node(src_idx)
+            local_dev = src_idx % args.n_gpus_per_node
+            remote_rank = dstsess2rank[sess_idx]
+        else:
+            node = get_node(dst_idx)
+            local_dev = dst_idx % args.n_gpus_per_node
+            remote_rank = srcsess2rank[sess_idx]
+
+        assert rank // ((curr_rank) // args.n_nodes) == node, f"Invalid node {node} for rank {rank}."
+
+        params += get_params(local_dev, remote_rank, is_client)
         params.append("")
 
-        params += get_params(recv_local_dev, send_rank, False)
-        params.append("")
-
-    return params, len(mc_sessions) * 2
+    return params, curr_rank
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
