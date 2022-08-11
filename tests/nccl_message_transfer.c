@@ -11,6 +11,10 @@
 #include <limits.h>
 #include "test-common.h"
 
+#define MIN(a,b) (((a)<(b))?(a):(b))
+#define MAX(a,b) (((a)>(b))?(a):(b))
+#define GETBW(s, t, n) ((s) * (n) * 8 / (t) / 1e3)
+
 double diff_microseconds(struct timespec start, struct timespec end)
 {
 	double microseconds;
@@ -290,12 +294,30 @@ int main(int argc, char* argv[])
 	OFINCCLCHECK(extNet->listen(dev, (void *)&handle, (void **)&lComm));
 
 	struct timespec start, end;
+	struct timespec group_end;
+
+	// measure the performance of MPI barrier
+	MPI_Barrier(MPI_COMM_WORLD); // sync first
+
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	for(int i=0; i < 20; i++) {
+		MPI_Barrier(MPI_COMM_WORLD);
+	}
+	clock_gettime(CLOCK_MONOTONIC, &end);
+	double barrier_time = diff_microseconds(start, end) / 20;
+	double global_barrier_time = 0;
+	MPI_Allreduce(&barrier_time, &global_barrier_time, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+	global_barrier_time /= num_ranks;
+	if(rank == 0) {
+		NCCL_OFI_INFO(NCCL_NET, "[Rank %d] Global barrier time: %f microseconds.", rank, global_barrier_time);
+	}
 
 	/* Allocate expected buffer */
 	char *expected_buf = NULL;
 	OFINCCLCHECK(allocate_buff((void **)&expected_buf, send_size, NCCL_PTR_HOST));
 
 	double time_per_iter[num_iters];
+	double time_per_iter_group[num_iters];
 
 	if (is_client) {
 
@@ -360,11 +382,14 @@ int main(int argc, char* argv[])
 			// stop timer
 			clock_gettime(CLOCK_MONOTONIC, &end);
 			MPI_Barrier(MPI_COMM_WORLD);
+			clock_gettime(CLOCK_MONOTONIC, &group_end);
 			NCCL_OFI_TRACE(NCCL_NET, "[Rank %d] Got completions for %d requests.", rank, num_requests);
 			if(iter >= num_warmup_iters) {
 				// calculate time
 				double time_elapsed = diff_microseconds(start, end);
+				double group_time_elapsed = diff_microseconds(start, group_end);
 				time_per_iter[iter - num_warmup_iters] = time_elapsed;
+				time_per_iter_group[iter - num_warmup_iters] = group_time_elapsed - global_barrier_time;
 			}
 		}
 	} else {
@@ -426,6 +451,7 @@ int main(int argc, char* argv[])
 			// stop timer. don't time data flush for now
 			clock_gettime(CLOCK_MONOTONIC, &end);
 			MPI_Barrier(MPI_COMM_WORLD);
+			clock_gettime(CLOCK_MONOTONIC, &group_end);
 			NCCL_OFI_TRACE(NCCL_NET, "[Rank %d] Got completions for %d requests.", rank, num_requests);
 			for(int idx = 0; idx < num_requests; idx++) {
 				if (buffer_type == NCCL_PTR_CUDA) {
@@ -464,7 +490,9 @@ int main(int argc, char* argv[])
 			if(iter >= num_warmup_iters) {
 				// calculate time
 				double time_elapsed = diff_microseconds(start, end);
+				double group_time_elapsed = diff_microseconds(start, group_end);
 				time_per_iter[iter - num_warmup_iters] = time_elapsed;
+				time_per_iter_group[iter - num_warmup_iters] = group_time_elapsed - global_barrier_time;
 			}
 		}
 	}
@@ -487,27 +515,115 @@ int main(int argc, char* argv[])
 			OFINCCLCHECK(deallocate_buffer(recv_buf[idx], buffer_type));
 	}
 
-	// synchronize time between all ranks
-	double local_min = time_per_iter[0];
-	double local_max = time_per_iter[0];
-	double local_sum = 0;
-	for(int i=0; i< num_iters; i++) {
-		local_min = local_min < time_per_iter[i] ? local_min : time_per_iter[i];
-		local_max = local_max > time_per_iter[i] ? local_max : time_per_iter[i];
-		local_sum += time_per_iter[i];
-	}
-	double global_min, global_max, global_sum;
-	MPI_Reduce(&local_min, &global_min, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
-	MPI_Reduce(&local_max, &global_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-	MPI_Reduce(&local_sum, &global_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+	// synchronize time between all ranks, and between send ranks and recv ranks
+	MPI_Comm subcomm;
+	MPI_Comm_split(MPI_COMM_WORLD, is_client, rank, &subcomm);
+	int subcomm_rank = -1;
+	int subcomm_nranks = -1;
+	MPI_Comm_rank(subcomm, &subcomm_rank);
+	MPI_Comm_size(subcomm, &subcomm_nranks);
 
-	if(rank == 0) {
-		double global_avg = global_sum / (double)(num_ranks * num_iters);
-		printf("[Rank %d] Time elapsed:\n", rank);
-		printf("[Rank %d]     Min: %f microseconds, equivalent bandwidth: %f Gbps per session.\n", rank, global_min, send_size * num_requests * 8 / global_min / 1e3);
-		printf("[Rank %d]     Max: %f microseconds, equivalent bandwidth: %f Gbps per session.\n", rank, global_max, send_size * num_requests * 8 / global_max / 1e3);
-		printf("[Rank %d]     Avg: %f microseconds, equivalent bandwidth: %f Gbps per session.\n", rank, global_avg, send_size * num_requests * 8 / global_avg / 1e3);
+	for (int comm_idx = 0; comm_idx < 2; comm_idx ++) {
+		MPI_Comm comm = (comm_idx == 0) ? subcomm : MPI_COMM_WORLD;
+		int comm_rank = (comm_idx == 0) ? subcomm_rank : rank;
+		int comm_num_ranks = (comm_idx == 0) ? subcomm_nranks : num_ranks;
+
+		double local_min = time_per_iter[0];
+		double local_min_group = time_per_iter_group[0];
+		double local_max = time_per_iter[0];
+		double local_max_group = time_per_iter_group[0];
+		double local_sum = 0;
+		double local_sum_group = 0;
+		for(int i=0; i< num_iters; i++) {
+			local_min = MIN(local_min, time_per_iter[i]);
+			local_min_group = MIN(local_min_group, time_per_iter_group[i]);
+			local_max = MAX(local_max, time_per_iter[i]);
+			local_max_group = MAX(local_max_group, time_per_iter_group[i]);
+			local_sum += time_per_iter[i];
+			local_sum_group += time_per_iter_group[i];
+		}
+		double global_min, global_min_group, global_max, global_max_group, global_sum, global_sum_group;
+		MPI_Reduce(&local_min, &global_min, 1, MPI_DOUBLE, MPI_MIN, 0, comm);
+		MPI_Reduce(&local_min_group, &global_min_group, 1, MPI_DOUBLE, MPI_MIN, 0, comm);
+		MPI_Reduce(&local_max, &global_max, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+		MPI_Reduce(&local_max_group, &global_max_group, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+		MPI_Reduce(&local_sum, &global_sum, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
+		MPI_Reduce(&local_sum_group, &global_sum_group, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
+
+		double global_max_per_iter[num_iters];
+		double global_max_per_iter_group[num_iters];
+		double global_min_per_iter[num_iters];
+		double global_min_per_iter_group[num_iters];
+		double global_sum_per_iter[num_iters];
+		double global_sum_per_iter_group[num_iters];
+		MPI_Reduce(time_per_iter, global_max_per_iter, num_iters, MPI_DOUBLE, MPI_MAX, 0, comm);
+		MPI_Reduce(time_per_iter_group, global_max_per_iter_group, num_iters, MPI_DOUBLE, MPI_MAX, 0, comm);
+		MPI_Reduce(time_per_iter, global_min_per_iter, num_iters, MPI_DOUBLE, MPI_MIN, 0, comm);
+		MPI_Reduce(time_per_iter_group, global_min_per_iter_group, num_iters, MPI_DOUBLE, MPI_MIN, 0, comm);
+		MPI_Reduce(time_per_iter, global_sum_per_iter, num_iters, MPI_DOUBLE, MPI_SUM, 0, comm);
+		MPI_Reduce(time_per_iter_group, global_sum_per_iter_group, num_iters, MPI_DOUBLE, MPI_SUM, 0, comm);
+
+
+		for(int print_idx = 0; print_idx < 3; print_idx ++) {
+			MPI_Barrier(MPI_COMM_WORLD);
+			if(((comm_idx == 0 && ((print_idx == 0 && is_client) || (print_idx == 1 && !is_client))) || (comm_idx == 1 && print_idx == 2)) && comm_rank == 0) {
+				double global_avg = global_sum / (double)(comm_num_ranks * num_iters);
+				double global_avg_group = global_sum_group / (double)(comm_num_ranks * num_iters);
+				double global_max_per_iter_avg = 0;
+				double global_max_per_iter_avg_group = 0;
+				double global_min_per_iter_avg = 0;
+				double global_min_per_iter_avg_group = 0;
+				double global_avg_per_iter_min = global_sum_per_iter[0] / comm_num_ranks;
+				double global_avg_per_iter_min_group = global_sum_per_iter_group[0] / comm_num_ranks;
+				double global_avg_per_iter_max = global_sum_per_iter[0] / comm_num_ranks;
+				double global_avg_per_iter_max_group = global_sum_per_iter_group[0] / comm_num_ranks;
+				for(int i=0; i< num_iters; i++) {
+					global_max_per_iter_avg += global_max_per_iter[i];
+					global_max_per_iter_avg_group += global_max_per_iter_group[i];
+					global_min_per_iter_avg += global_min_per_iter[i];
+					global_min_per_iter_avg_group += global_min_per_iter_group[i];
+					global_avg_per_iter_min = MIN(global_avg_per_iter_min, global_sum_per_iter[i] / comm_num_ranks);
+					global_avg_per_iter_min_group = MIN(global_avg_per_iter_min_group, global_sum_per_iter_group[i] / comm_num_ranks);
+					global_avg_per_iter_max = MAX(global_avg_per_iter_max, global_sum_per_iter[i] / comm_num_ranks);
+					global_avg_per_iter_max_group = MAX(global_avg_per_iter_max_group, global_sum_per_iter_group[i] / comm_num_ranks);
+				}
+				global_max_per_iter_avg /= (double)num_iters;
+				global_max_per_iter_avg_group /= (double)num_iters;
+				global_min_per_iter_avg /= (double)num_iters;
+				global_min_per_iter_avg_group /= (double)num_iters;
+
+				if (comm_idx == 0) {
+					if (is_client) {
+						printf("[Rank %d] Time elapsed for send:\n", rank);
+					} else {
+						printf("[Rank %d] Time elapsed for recv:\n", rank);
+					}
+				} else {
+					printf("[Rank %d] Time elapsed for all:\n", rank);
+				}
+				printf("[Rank %d]     MPI_Barrier cost: %f microseconds.\n", rank, global_barrier_time);
+				printf("[Rank %d]     Min: %f microseconds, equivalent bandwidth: %f Gbps per session.\n", rank, global_min, GETBW(send_size, global_min, num_requests));
+				printf("[Rank %d]     Group Min: %f microseconds, equivalent bandwidth: %f Gbps per session.\n", rank, global_min_group, GETBW(send_size, global_min_group, num_requests));
+				printf("[Rank %d]     Max: %f microseconds, equivalent bandwidth: %f Gbps per session.\n", rank, global_max, GETBW(send_size, global_max, num_requests));
+				printf("[Rank %d]     Group Max: %f microseconds, equivalent bandwidth: %f Gbps per session.\n", rank, global_max_group, GETBW(send_size, global_max_group, num_requests));
+				printf("[Rank %d]     Avg MaxPerIter: %f microseconds, equivalent bandwidth: %f Gbps per session.\n", rank, global_max_per_iter_avg, GETBW(send_size, global_max_per_iter_avg, num_requests));
+				printf("[Rank %d]     Group Avg MaxPerIter: %f microseconds, equivalent bandwidth: %f Gbps per session.\n", rank, global_max_per_iter_avg_group, GETBW(send_size, global_max_per_iter_avg_group, num_requests));
+				printf("[Rank %d]     Avg MinPerIter: %f microseconds, equivalent bandwidth: %f Gbps per session.\n", rank, global_min_per_iter_avg, GETBW(send_size, global_min_per_iter_avg, num_requests));
+				printf("[Rank %d]     Group Avg MinPerIter: %f microseconds, equivalent bandwidth: %f Gbps per session.\n", rank, global_min_per_iter_avg_group, GETBW(send_size, global_min_per_iter_avg_group, num_requests));
+				printf("[Rank %d]     Max AveragePerIter: %f microseconds, equivalent bandwidth: %f Gbps per session.\n", rank, global_avg_per_iter_max, GETBW(send_size, global_avg_per_iter_max, num_requests));
+				printf("[Rank %d]     Group Max AveragePerIter: %f microseconds, equivalent bandwidth: %f Gbps per session.\n", rank, global_avg_per_iter_max_group, GETBW(send_size, global_avg_per_iter_max_group, num_requests));
+				printf("[Rank %d]     Min AveragePerIter: %f microseconds, equivalent bandwidth: %f Gbps per session.\n", rank, global_avg_per_iter_min, GETBW(send_size, global_avg_per_iter_min, num_requests));
+				printf("[Rank %d]     Group Min AveragePerIter: %f microseconds, equivalent bandwidth: %f Gbps per session.\n", rank, global_avg_per_iter_min_group, GETBW(send_size, global_avg_per_iter_min_group, num_requests));
+				printf("[Rank %d]     Avg: %f microseconds, equivalent bandwidth: %f Gbps per session.\n", rank, global_avg, GETBW(send_size, global_avg, num_requests));
+				printf("[Rank %d]     Group Avg: %f microseconds, equivalent bandwidth: %f Gbps per session.\n", rank, global_avg_group, GETBW(send_size, global_avg_group, num_requests));
+				printf("\n");
+			}
+			MPI_Barrier(MPI_COMM_WORLD);
+		}
+
+		MPI_Barrier(MPI_COMM_WORLD);
 	}
+
 
 	OFINCCLCHECK(extNet->closeListen((void *)lComm));
 	OFINCCLCHECK(extNet->closeSend((void *)sComm));
